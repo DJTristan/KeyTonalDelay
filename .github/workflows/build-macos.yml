@@ -1,0 +1,70 @@
+name: Build and validate Key Tonal Delay (Mac)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 55
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure universal Mac AU and VST3
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DBUILD_PLUGIN=ON -DBUILD_TESTING=ON
+
+      - name: Compile plugins and DSP tests
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test audio engine
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package, inspect and ad-hoc sign plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p plugins
+          while IFS= read -r -d '' bundle; do
+            echo "Found: $bundle"
+            cp -R "$bundle" plugins/
+          done < <(find build -type d \( -name '*.vst3' -o -name '*.component' \) -print0)
+          test "$(find plugins -maxdepth 1 -name '*.vst3' -type d | wc -l | tr -d ' ')" = 1
+          test "$(find plugins -maxdepth 1 -name '*.component' -type d | wc -l | tr -d ' ')" = 1
+          for bundle in plugins/*.vst3 plugins/*.component; do
+            codesign --force --sign - "$bundle"
+            codesign --verify --deep --strict --verbose=2 "$bundle"
+            binary="$(find "$bundle/Contents/MacOS" -maxdepth 1 -type f | head -n 1)"
+            file "$binary"
+            lipo -verify_arch x86_64 arm64 "$binary"
+          done
+          ditto -c -k --keepParent plugins KeyTonalDelay-Universal-Mac.zip
+
+      - name: Validate Audio Unit loads on macOS
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$HOME/Library/Audio/Plug-Ins/Components"
+          cp -R "plugins/Key Tonal Delay.component" "$HOME/Library/Audio/Plug-Ins/Components/"
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 4
+          auval -v aufx KtDl KTDY 2>&1 | tee auval-report.txt
+          grep -q 'AU VALIDATION SUCCEEDED' auval-report.txt
+
+      - name: Upload fully tested plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeyTonalDelay-Universal-Mac
+          path: KeyTonalDelay-Universal-Mac.zip
+          if-no-files-found: error
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mac-Validation-Diagnostics
+          path: auval-report.txt
+          if-no-files-found: ignore
